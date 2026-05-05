@@ -132,5 +132,6 @@ def main():
     print(f"  Outputs in {config.OUTPUT_DIR}")
 
 
+# run
 if __name__ == "__main__":
     main()
