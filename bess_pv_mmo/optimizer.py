@@ -41,9 +41,10 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
     bess_dis    = cp.Variable(Q, nonneg=True)   # discharge to grid
     pv_grid     = cp.Variable(Q, nonneg=True)   # PV exported to grid
     pv_to_bess  = cp.Variable(Q, nonneg=True)   # PV routed to BESS (no market settlement)
-    soc         = cp.Variable(Q)
-    is_dis      = cp.Variable(Q, boolean=True)
+    soc         = cp.Variable(Q)                # SOc of the battery
+    is_dis      = cp.Variable(Q, boolean=True)  # Variable (MILP) that makes sure battery does not charge and discharge sim.
 
+    # This either makes aFRR a constant that is just true. Or a varaible that we optimize one.
     phase_a = afrr_fixed is None
     if phase_a:
         afrr_up_bess   = cp.Variable(H, integer=True)
@@ -57,6 +58,12 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
         afrr_dn_pv   = cp.Constant(np.asarray(afrr_fixed["pv_down"],   dtype=float))
 
     # Quarter <-> hour expansion
+    # - h_of_q — for each quarter q, its hour index. With QPH=4, it's [0,0,0,0,1,1,1,1,...,23,23,23,23].
+    # - last_q_of_h — the index of the last quarter inside each hour: [3, 7, 11, ..., 95]. Used to pin the per-hour
+    #   SOC reserve check to end-of-hour SOC.
+    # - afrr_*_q = afrr_*[h_of_q] — fancy-indexing trick that "broadcasts" each hourly aFRR variable across its 4
+    #   quarters, producing a length-96 CVXPY expression. Now hourly capacity commitments and quarterly dispatch live
+    #   on the same axis and can be added/subtracted directly in constraints.
     h_of_q = np.arange(Q) // QPH
     last_q_of_h = np.arange(H) * QPH + (QPH - 1)
     afrr_up_bess_q = afrr_up_bess[h_of_q]
@@ -64,9 +71,11 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
     afrr_up_pv_q   = afrr_up_pv[h_of_q]
     afrr_dn_pv_q   = afrr_dn_pv[h_of_q]
 
+    # just make to an array
     pv   = pv_forecast_mw.to_numpy()
     spot = spot_prices.to_numpy()
 
+    # Net export is based on pv and bess (excludes afrr)
     net_export = bess_dis - bess_chg + pv_grid
 
     # ── Constraints ─────────────────────────────────────────────────────────
@@ -82,8 +91,10 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
         bess_dis + afrr_up_bess_q                <= config.BESS_POWER_MW,
         bess_chg + pv_to_bess + afrr_dn_bess_q   <= config.BESS_POWER_MW,
 
-        # PV UP: can only redirect what is currently going to BESS
-        afrr_up_pv_q <= pv_to_bess,
+        # PV UP: served from un-curtailed PV — direct PV-to-grid, BESS untouched, no SOC drift.
+        # Equivalent to "PV not already routed to grid or BESS". The optimiser is free to
+        # reduce pv_to_bess at planning time if more PV UP capacity is profitable.
+        afrr_up_pv_q <= pv - pv_grid - pv_to_bess,
         # PV DOWN: can only curtail what is currently exported to grid
         afrr_dn_pv_q <= pv_grid,
 
@@ -102,9 +113,9 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
         soc[Q - 1] == config.BESS_SOC_INITIAL_MWH,
 
         # Per-hour aFRR feasibility — end-of-hour SOC under full-hour activation:
-        # UP scenario: BESS discharges +afrr_up_bess MWh AND PV stops charging BESS
-        # by afrr_up_pv MWh — both reduce SOC.
-        soc[last_q_of_h] - (afrr_up_bess + afrr_up_pv) * 1.0 >= 0,
+        # UP scenario: only BESS UP drains SOC. PV UP is direct PV-to-grid (un-curtailment),
+        # so it never touches the battery.
+        soc[last_q_of_h] - afrr_up_bess * 1.0 >= 0,
         # DOWN scenario: only BESS DOWN raises SOC (PV DOWN is just curtailment).
         soc[last_q_of_h] + afrr_dn_bess * 1.0 <= config.BESS_ENERGY_MWH,
 
@@ -112,31 +123,29 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
         cp.sum(bess_dis) * dt <= config.BESS_DAILY_DISCHARGE_LIMIT_MWH,
     ]
 
-    # ── Grid limit — combined worst case (activation + ID mitigation) ─────
-    # In hour h≥1 the worst-case grid load combines THIS hour's activation with
-    # OPPOSITE-direction ID mitigation for hour h-1's commitment, since both can
-    # fire in the same hour (frequency swings between hours).
-    #   - Worst IMPORT: DOWN activated in h  +  ID buy refilling UP from h-1
-    #   - Worst EXPORT: UP   activated in h  +  ID sell draining DOWN from h-1
-    # These supersede the activation-only and ID-only checks for h≥1 (subsume both).
-    # First hour exempt — no prior activation to mitigate, activation-only check above suffices.
+    # ── Grid limit with ID restoration ──────────────────────────────────────
+    # In any hour h ≥ 1 two flows can stack on the same side of the meter:
+    #   1) this hour's aFRR activation
+    #   2) an ID order placed this hour to restore SOC from h-1's activation
+    # Both must fit inside ±95 MW together with the planned net_export.
+    #
+    # PV UP / PV DOWN are excluded from ID restoration: PV UP comes from
+    # un-curtailed PV (battery untouched) and PV DOWN is curtailment (no flow).
+    # Hour 0 is exempt — no prior commitment to restore.
     for h in range(1, H):
-        sl = slice(h * QPH, (h + 1) * QPH)
+        q = slice(h * QPH, (h + 1) * QPH)
+
+        # IMPORT side (negative net_export): DOWN absorbs, ID buy imports to refill UP
+        activation_in = afrr_dn_bess[h]            # DOWN activation pulls power in
+        id_refill_in  = afrr_up_bess[h - 1]        # buy back BESS UP delivered in h-1
+
+        # EXPORT side (positive net_export): UP injects, ID sell exports to drain DOWN
+        activation_out = afrr_up_bess[h] + afrr_up_pv[h]
+        id_drain_out   = afrr_dn_bess[h - 1]       # sell off BESS DOWN absorbed in h-1
+
         cons += [
-            # IMPORT worst case: BESS DOWN activation in h + ID buy refilling BESS UP from h-1
-            # PV UP excluded — redirecting pv_to_bess to grid never drained BESS energy,
-            # so no grid-side restoration needed (the within-hour SOC reserve handles the
-            # planned trajectory shortfall).
-            # PV DOWN excluded — curtailment, not new grid draw.
-            net_export[sl]
-                - afrr_dn_bess[h]
-                - afrr_up_bess[h - 1]
-                >= -config.GRID_LIMIT_MW,
-            # EXPORT worst case: UP activation in h + ID sell draining BESS DOWN from h-1
-            net_export[sl]
-                + (afrr_up_bess[h] + afrr_up_pv[h])
-                + afrr_dn_bess[h - 1]
-                <= config.GRID_LIMIT_MW,
+            net_export[q] - activation_in  - id_refill_in >= -config.GRID_LIMIT_MW,
+            net_export[q] + activation_out + id_drain_out <=  config.GRID_LIMIT_MW,
         ]
 
     if phase_a:
@@ -145,7 +154,7 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
             afrr_dn_bess >= 0, afrr_dn_bess <= config.BESS_POWER_MW,
             afrr_up_pv   >= 0, afrr_up_pv   <= config.PV_CAPACITY_MW,
             afrr_dn_pv   >= 0, afrr_dn_pv   <= config.PV_CAPACITY_MW,
-            # No aFRR in the last hour — avoids end-SOC-target trap
+            # No aFRR in the last hour — avoids end-SOC-target trap. VERY VERY SIMPLIFIED!
             afrr_up_bess[H - 1] == 0,
             afrr_dn_bess[H - 1] == 0,
             afrr_up_pv[H - 1]   == 0,
@@ -153,7 +162,10 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
         ]
 
     # ── Objective ───────────────────────────────────────────────────────────
+
+    #money made from allcating to DA market
     da_revenue = cp.sum(cp.multiply(spot, net_export)) * dt
+    #
     cycle_cost = cp.sum(bess_dis) * dt * config.BESS_CYCLE_COST_EUR_PER_MWH
 
     if afrr_up_price is not None:

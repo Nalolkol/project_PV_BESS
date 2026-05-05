@@ -1,11 +1,10 @@
 """aFRR price forecast — simple historic mean by hour-of-day.
 
-Kept intentionally minimal given (a) we bid 0 EUR/MW so volume choice is the
-only thing forecast accuracy affects, and (b) the ID-mitigation assumption
-absorbs forecast error on activation impact.
+Should have added 'remove outlier' prices like remove higest 1% of values or something similar
 """
-import pandas as pd
 
+
+import pandas as pd
 import config
 
 

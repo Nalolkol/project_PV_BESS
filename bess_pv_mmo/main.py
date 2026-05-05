@@ -21,11 +21,6 @@ import forecast
 import optimizer
 import plots
 
-# ── Knobs — edit and run ───────────────────────────────────────────────────
-RUN_DATE   = "2026-05-01"   # Trading day, YYYY-MM-DD
-RUN_ORACLE = True           # True → also run perfect-foresight benchmark
-# ───────────────────────────────────────────────────────────────────────────
-
 
 def sanity_check(schedule):
     """Hard asserts: solver output must respect the physical constraints."""
@@ -131,6 +126,11 @@ def main():
     print()
     print(f"  Outputs in {config.OUTPUT_DIR}")
 
+
+# ── edit and run ───────────────────────────────────────────────────
+RUN_DATE   = "2026-05-01"   # Trading day, YYYY-MM-DD
+RUN_ORACLE = True           # True → also run perfect-foresight benchmark
+# ───────────────────────────────────────────────────────────────────────────
 
 # run
 if __name__ == "__main__":
