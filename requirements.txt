@@ -1,2 +1,6 @@
 pandas==3.0.2
-requests
+numpy==2.4.4
+cvxpy==1.8.2
+highspy==1.14.0
+plotly==6.7.0
+requests==2.33.1
