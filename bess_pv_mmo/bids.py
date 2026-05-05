@@ -40,7 +40,7 @@ def build_afrr_bids(volumes):
 
 
 def clear_afrr(bids, actual_afrr):
-    """Pay-as-cleared per asset/direction. Returns one row per hour with all 4 categories."""
+    """Pay-as-cleared (marginal) per asset/direction. Returns one row per hour with all 4 categories."""
     actual_up   = actual_afrr["up"].to_numpy()
     actual_down = actual_afrr["down"].to_numpy()
     rows = []
@@ -127,13 +127,21 @@ def compute_profit(schedule, spot_prices, cleared):
     }
 
 
-def save_outputs(date, afrr_bids_long, da_bid_matrix, schedule, suffix=""):
-    """Write the two required bid matrices plus the schedule to CSV."""
+def _date_suffix(date, suffix):
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    date_str = date.strftime("%Y-%m-%d")
-    sfx = f"_{suffix}" if suffix else ""
+    return date.strftime("%Y-%m-%d"), (f"_{suffix}" if suffix else "")
+
+
+def save_afrr_outputs(date, afrr_bids_long, suffix=""):
+    """Phase A output: aFRR bid matrices. Submitted at 07:30 D-1, before DA clears."""
+    date_str, sfx = _date_suffix(date, suffix)
     up_wide, down_wide = afrr_bids_to_wide(afrr_bids_long)
     up_wide.to_csv(  config.OUTPUT_DIR / f"bids_afrr_up_{date_str}{sfx}.csv",   index=True)
     down_wide.to_csv(config.OUTPUT_DIR / f"bids_afrr_down_{date_str}{sfx}.csv", index=True)
-    da_bid_matrix.to_csv(config.OUTPUT_DIR / f"bids_da_{date_str}{sfx}.csv",    index=True)
+
+
+def save_da_outputs(date, da_bid_matrix, schedule, suffix=""):
+    """Phase B output: DA bid matrix + final dispatch schedule. Submitted at 12:00 D-1."""
+    date_str, sfx = _date_suffix(date, suffix)
+    da_bid_matrix.to_csv(config.OUTPUT_DIR / f"bids_da_{date_str}{sfx}.csv", index=True)
     schedule.to_csv(     config.OUTPUT_DIR / f"schedule_{date_str}{sfx}.csv")

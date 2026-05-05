@@ -23,7 +23,10 @@ import plots
 
 
 def sanity_check(schedule):
-    """Hard asserts: solver output must respect the physical constraints."""
+    """
+    Hard asserts: solver output must respect the physical constraints.
+    Needs some more work... :/
+    """
     soc = schedule["soc_mwh"].values
     ne  = schedule["net_export_mw"].values
     chg = schedule["bess_charge_mw"].values + schedule["pv_to_bess_mw"].values
@@ -46,6 +49,7 @@ def run_scenario(day, spot, pv, actual_afrr, afrr_prices_for_phase_a,
     """Phase A → clear → Phase B → outputs. Returns the profit dict."""
     print(f"== {day.date()}  scenario: {label} ==")
 
+    # ── Phase A: 07:30 D-1 — submit aFRR bids ──────────────────────────────
     a = optimizer.solve(spot, pv, config.BESS_SOC_INITIAL_MWH,
                         afrr_up_price=afrr_prices_for_phase_a["up"],
                         afrr_down_price=afrr_prices_for_phase_a["down"])
@@ -53,8 +57,12 @@ def run_scenario(day, spot, pv, actual_afrr, afrr_prices_for_phase_a,
     volumes = {"bess_up":   a["bess_up"],   "bess_down": a["bess_down"],
                "pv_up":     a["pv_up"],     "pv_down":   a["pv_down"]}
     afrr_bids_long = bids.build_afrr_bids(volumes)
-    cleared        = bids.clear_afrr(afrr_bids_long, actual_afrr)
+    bids.save_afrr_outputs(day, afrr_bids_long, suffix=suffix)
 
+    # ── aFRR auction clears ────────────────────────────────────────────────
+    cleared = bids.clear_afrr(afrr_bids_long, actual_afrr)
+
+    # ── Phase B: 12:00 D-1 — re-solve DA with cleared aFRR fixed ───────────
     b = optimizer.solve(spot, pv, config.BESS_SOC_INITIAL_MWH,
                         afrr_fixed={
                             "bess_up":   cleared["bess_up"].to_numpy(),
@@ -68,7 +76,7 @@ def run_scenario(day, spot, pv, actual_afrr, afrr_prices_for_phase_a,
     da_bid_matrix = bids.build_da_bid_matrix(b["schedule"]["net_export_mw"], spot)
     profit        = bids.compute_profit(b["schedule"], spot, cleared)
 
-    bids.save_outputs(day, afrr_bids_long, da_bid_matrix, b["schedule"], suffix=suffix)
+    bids.save_da_outputs(day, da_bid_matrix, b["schedule"], suffix=suffix)
     plots.plot_all(day, spot, pv, afrr_prices_for_phase_a, actual_afrr,
                    cleared, b["schedule"], profit, scenario_label=label)
     return profit
