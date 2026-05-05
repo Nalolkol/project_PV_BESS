@@ -168,12 +168,14 @@ def solve(spot_prices, pv_forecast_mw, soc_start_mwh, *,
     #
     cycle_cost = cp.sum(bess_dis) * dt * config.BESS_CYCLE_COST_EUR_PER_MWH
 
+    # If Phase with aFRR we optimize on all. Else optimize with constant aFRR allocaiton and can only use DA!
     if afrr_up_price is not None:
         up_total = afrr_up_bess + afrr_up_pv
         dn_total = afrr_dn_bess + afrr_dn_pv
         afrr_revenue = (cp.sum(cp.multiply(afrr_up_price.to_numpy(),   up_total))
                         + cp.sum(cp.multiply(afrr_down_price.to_numpy(), dn_total)))
         objective = cp.Maximize(da_revenue + afrr_revenue - cycle_cost)
+    # Phase only DA!
     else:
         objective = cp.Maximize(da_revenue - cycle_cost)
 
